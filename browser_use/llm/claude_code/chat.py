@@ -1,8 +1,8 @@
 """
-ChatClaudeCode - browser-use LLM provider that uses the Claude Code CLI binary.
+ChatClaudeCode - browser-use LLM provider using the Claude Code Python SDK.
 
-This lets you run browser-use with your Claude Code subscription ($0 API cost)
-by shelling out to `claude --print` instead of calling the Anthropic API directly.
+Uses your Claude Code subscription ($0 API cost) via the claude-code-sdk package,
+which manages the CLI subprocess internally with proper streaming.
 """
 
 import asyncio
@@ -29,9 +29,8 @@ logger = logging.getLogger(__name__)
 
 
 def _messages_to_prompt(messages: list[BaseMessage]) -> str:
-	"""Convert browser-use messages into a single text prompt for claude --print."""
+	"""Convert browser-use messages into a single text prompt."""
 	parts: list[str] = []
-
 	for msg in messages:
 		if isinstance(msg, SystemMessage):
 			parts.append(f'[SYSTEM]\n{msg.text}')
@@ -39,22 +38,21 @@ def _messages_to_prompt(messages: list[BaseMessage]) -> str:
 			parts.append(f'[USER]\n{msg.text}')
 		elif isinstance(msg, AssistantMessage):
 			parts.append(f'[ASSISTANT]\n{msg.text}')
-
 	return '\n\n'.join(parts)
 
 
 @dataclass
 class ChatClaudeCode(BaseChatModel):
 	"""
-	A browser-use LLM provider that uses the Claude Code CLI binary.
+	browser-use LLM provider using the Claude Code Python SDK.
 
-	Uses your Claude Code subscription instead of API credits.
-	Shells out to `claude --print --output-format json` for each invocation.
+	Uses your subscription — no API key needed.
 	"""
 
 	model: str = 'sonnet'
-	claude_binary: str = 'claude'
-	timeout: float = 120.0
+	timeout: float = 300.0
+	system_prompt: str = 'You are a browser automation assistant. Follow instructions precisely. Be concise. When asked for structured output, return ONLY valid JSON.'
+	max_turns: int = 1
 	extra_flags: list[str] = field(default_factory=list)
 
 	@property
@@ -64,6 +62,47 @@ class ChatClaudeCode(BaseChatModel):
 	@property
 	def name(self) -> str:
 		return f'claude-code:{self.model}'
+
+	async def _call_sdk(self, prompt: str) -> str:
+		"""Call Claude via the Python SDK, handling unknown message types gracefully."""
+		from claude_code_sdk import ClaudeCodeOptions, query
+
+		texts: list[str] = []
+
+		try:
+			async for msg in query(
+				prompt=prompt,
+				options=ClaudeCodeOptions(
+					model=self.model,
+					max_turns=self.max_turns,
+					system_prompt=self.system_prompt,
+				),
+			):
+				# Collect text content from assistant messages
+				if hasattr(msg, 'content') and msg.content:
+					content = msg.content
+					if isinstance(content, str):
+						texts.append(content)
+					elif isinstance(content, list):
+						for block in content:
+							if hasattr(block, 'text'):
+								texts.append(block.text)
+							elif isinstance(block, dict) and 'text' in block:
+								texts.append(block['text'])
+		except Exception as e:
+			err_str = str(e)
+			# Handle rate_limit_event parse errors from SDK
+			if 'Unknown message type' in err_str and texts:
+				# We already got content before the error, use it
+				logger.warning(f'SDK parse error after receiving content: {err_str[:100]}')
+			elif 'rate_limit' in err_str.lower():
+				logger.warning('Rate limited, retrying in 5s...')
+				await asyncio.sleep(5)
+				return await self._call_sdk(prompt)
+			else:
+				raise ModelProviderError(message=f'Claude SDK error: {err_str[:300]}', model=self.name) from e
+
+		return '\n'.join(texts)
 
 	@overload
 	async def ainvoke(
@@ -78,127 +117,51 @@ class ChatClaudeCode(BaseChatModel):
 	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
 		prompt = _messages_to_prompt(messages)
 
-		cmd = [
-			self.claude_binary,
-			'--print',
-			'--output-format', 'json',
-			'--model', self.model,
-			'--no-session-persistence',
-		]
-
 		if output_format is not None:
 			schema = output_format.model_json_schema()
-			cmd.extend(['--json-schema', json.dumps(schema)])
-
-		cmd.extend(self.extra_flags)
+			prompt += f'\n\n[RESPOND WITH ONLY VALID JSON matching this schema. No markdown fences, no explanation, JUST the JSON object.]\n{json.dumps(schema, indent=2)}'
 
 		try:
-			proc = await asyncio.create_subprocess_exec(
-				*cmd,
-				stdin=asyncio.subprocess.PIPE,
-				stdout=asyncio.subprocess.PIPE,
-				stderr=asyncio.subprocess.PIPE,
-			)
-
-			stdout, stderr = await asyncio.wait_for(
-				proc.communicate(input=prompt.encode('utf-8')),
+			result_text = await asyncio.wait_for(
+				self._call_sdk(prompt),
 				timeout=self.timeout,
 			)
-
-			if proc.returncode != 0:
-				error_msg = stderr.decode('utf-8', errors='replace').strip()
-				raise ModelProviderError(
-					message=f'claude CLI exited with code {proc.returncode}: {error_msg}',
-					model=self.name,
-				)
-
-			raw_output = stdout.decode('utf-8').strip()
-
-			if not raw_output:
-				raise ModelProviderError(
-					message='claude CLI returned empty output',
-					model=self.name,
-				)
-
-			# Parse the JSON output from claude --print --output-format json
-			try:
-				cli_response = json.loads(raw_output)
-			except json.JSONDecodeError:
-				# If it's not JSON, treat as raw text (shouldn't happen with --output-format json)
-				cli_response = {'result': raw_output}
-
-			# Extract result from claude CLI JSON output
-			result_text = ''
-			structured_data = None
-			if isinstance(cli_response, dict):
-				# Check for structured_output first (used with --json-schema)
-				structured_data = cli_response.get('structured_output')
-				result_text = cli_response.get('result', '')
-			elif isinstance(cli_response, list):
-				for block in cli_response:
-					if isinstance(block, dict):
-						if block.get('type') == 'result':
-							structured_data = block.get('structured_output')
-							result_text = block.get('result', '')
-							break
-						elif block.get('type') == 'text':
-							result_text += block.get('text', '')
-			if not result_text and not structured_data and isinstance(cli_response, str):
-				result_text = cli_response
-
-			# Extract usage from CLI response if available
-			cli_usage = cli_response.get('usage', {}) if isinstance(cli_response, dict) else {}
-			input_tokens = cli_usage.get('input_tokens', 0)
-			output_tokens = cli_usage.get('output_tokens', 0)
-			cached_tokens = cli_usage.get('cache_read_input_tokens', 0)
-			cache_creation = cli_usage.get('cache_creation_input_tokens', 0)
-
-			usage = ChatInvokeUsage(
-				prompt_tokens=input_tokens + cached_tokens,
-				completion_tokens=output_tokens,
-				total_tokens=input_tokens + output_tokens + cached_tokens,
-				prompt_cached_tokens=cached_tokens if cached_tokens else None,
-				prompt_cache_creation_tokens=cache_creation if cache_creation else None,
-				prompt_image_tokens=None,
-			)
-
-			if output_format is not None:
-				# For structured output, use structured_data if available, fall back to result_text
-				try:
-					if structured_data is not None:
-						completion = output_format.model_validate(structured_data)
-					elif result_text:
-						try:
-							completion = output_format.model_validate_json(result_text)
-						except Exception:
-							data = json.loads(result_text)
-							completion = output_format.model_validate(data)
-					else:
-						raise ValueError('No structured_output or result in CLI response')
-				except Exception as e:
-					raise ModelProviderError(
-						message=f'Failed to parse structured output: {e}\nRaw: {str(structured_data or result_text)[:500]}',
-						model=self.name,
-					) from e
-
-				return ChatInvokeCompletion(
-					completion=completion,
-					usage=usage,
-					stop_reason=cli_response.get('stop_reason', 'end_turn') if isinstance(cli_response, dict) else 'end_turn',
-				)
-			else:
-				return ChatInvokeCompletion(
-					completion=result_text,
-					usage=usage,
-					stop_reason=cli_response.get('stop_reason', 'end_turn') if isinstance(cli_response, dict) else 'end_turn',
-				)
-
 		except asyncio.TimeoutError as e:
-			raise ModelProviderError(
-				message=f'claude CLI timed out after {self.timeout}s',
-				model=self.name,
-			) from e
+			raise ModelProviderError(message=f'Claude SDK timed out after {self.timeout}s', model=self.name) from e
 		except ModelProviderError:
 			raise
 		except Exception as e:
 			raise ModelProviderError(message=str(e), model=self.name) from e
+
+		usage = ChatInvokeUsage(
+			prompt_tokens=0,
+			completion_tokens=0,
+			total_tokens=0,
+			prompt_cached_tokens=None,
+			prompt_cache_creation_tokens=None,
+			prompt_image_tokens=None,
+		)
+
+		if output_format is not None:
+			try:
+				text = result_text.strip()
+				# Strip markdown code fences if present
+				if text.startswith('```'):
+					text = text.split('\n', 1)[1] if '\n' in text else text[3:]
+					if text.endswith('```'):
+						text = text[:-3]
+					text = text.strip()
+				try:
+					completion = output_format.model_validate_json(text)
+				except Exception:
+					data = json.loads(text)
+					completion = output_format.model_validate(data)
+			except Exception as e:
+				raise ModelProviderError(
+					message=f'Failed to parse structured output: {e}\nRaw: {result_text[:500]}',
+					model=self.name,
+				) from e
+
+			return ChatInvokeCompletion(completion=completion, usage=usage, stop_reason='end_turn')
+		else:
+			return ChatInvokeCompletion(completion=result_text, usage=usage, stop_reason='end_turn')
