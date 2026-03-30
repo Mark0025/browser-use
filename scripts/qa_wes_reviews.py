@@ -92,7 +92,7 @@ At the end, provide a structured QA report with:
 		step_timeout=240,
 	)
 
-	result = await agent.run(max_steps=15)
+	result = await agent.run(max_steps=20)
 
 	# Print the final result
 	print('\n' + '=' * 80)
