@@ -182,6 +182,35 @@ def save_report(name: str, report: str) -> Path:
 	return path
 
 
+def create_test_image(path: str = '/tmp/browser-use-test-image.png') -> str:
+	"""Create a 100x100 red PNG for upload testing."""
+	import struct
+	import zlib as _zlib
+
+	width, height = 100, 100
+	raw_data = b''
+	for y in range(height):
+		raw_data += b'\x00'
+		for x in range(width):
+			raw_data += b'\xff\x00\x00'
+
+	compressed = _zlib.compress(raw_data)
+
+	def chunk(chunk_type: bytes, data: bytes) -> bytes:
+		c = chunk_type + data
+		crc = struct.pack('>I', _zlib.crc32(c) & 0xffffffff)
+		return struct.pack('>I', len(data)) + c + crc
+
+	png = b'\x89PNG\r\n\x1a\n'
+	png += chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0))
+	png += chunk(b'IDAT', compressed)
+	png += chunk(b'IEND', b'')
+
+	Path(path).write_bytes(png)
+	logger.info(f'Created test image at {path} ({len(png)} bytes)')
+	return path
+
+
 def cleanup_temp_profiles():
 	"""Remove all temporary Chrome profiles."""
 	import glob
