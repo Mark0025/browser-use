@@ -16,11 +16,13 @@ from loguru import logger
 from browser_use import Agent
 
 logger.remove()
-logger.add(sys.stderr, format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{message}</cyan>", level="INFO")
-logger.add("scripts/qa_reports/qa_final_{time:YYYY-MM-DD}.log", rotation="10 MB", level="DEBUG")
+logger.add(
+	sys.stderr, format='<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{message}</cyan>', level='INFO'
+)
+logger.add('scripts/qa_reports/qa_final_{time:YYYY-MM-DD}.log', rotation='10 MB', level='DEBUG')
 
 from shared import (
-	DEV_URL,
+	TestResultMemory,
 	cleanup_temp_profiles,
 	create_browser_session,
 	create_llm,
@@ -35,8 +37,32 @@ async def main():
 	llm = create_llm('sonnet')
 	session, tmp_dir = create_browser_session()
 
+	# Load test result memory
+	memory = TestResultMemory()
+	final_sections = [
+		'users',
+		'branding',
+		'help',
+		'sign_in',
+		'sign_up',
+		'preview_mode',
+		'preview_about',
+		'preview_how_it_works',
+		'preview_blogs',
+		'preview_blog_detail',
+		'dev_manual',
+		'lead_form',
+		'image_upload',
+		'blog_detail_lead_form',
+		'404_page',
+	]
+	memory.ensure_sections_tracked(final_sections)
+	memory_prompt = memory.prompt_section()
+
 	task = f"""You are doing the FINAL QA pass on https://dev.fairdealhousebuyer.com.
 You must test every item below. No exceptions. Auth: mark@localhousebuyers.net (already logged in via Chrome profile).
+
+{memory_prompt}
 
 ## CRITICAL: ALL URLs use https://dev.fairdealhousebuyer.com
 ## DO NOT visit /dev-admin — it is restricted.
@@ -200,6 +226,15 @@ At the end, include:
 	print('=' * 80)
 
 	save_report('qa_final', report)
+
+	# Update test result memory from the report
+	memory.update_from_report(report, final_sections)
+	memory.save()
+	logger.info(
+		f'Test memory updated: {len(memory.passed_sections())} passed, '
+		f'{len(memory.failed_sections())} failed, {len(memory.untested_sections())} untested'
+	)
+
 	shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
