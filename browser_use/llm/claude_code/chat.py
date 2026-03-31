@@ -1,13 +1,17 @@
 """
 ChatClaudeCode - browser-use LLM provider using the Claude Code Python SDK.
 
-Uses your Claude Code subscription ($0 API cost) via the claude-code-sdk package,
-which manages the CLI subprocess internally with proper streaming.
+Uses your Claude Code subscription ($0 API cost) via the claude-code-sdk package.
+
+Performance optimization: uses ClaudeSDKClient to maintain a persistent subprocess
+connection, eliminating the ~10s cold-start overhead on every call after the first.
+The first call pays the startup cost; subsequent calls go straight to the API (~3-5s).
 """
 
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, TypeVar, overload
 
@@ -46,7 +50,9 @@ class ChatClaudeCode(BaseChatModel):
 	"""
 	browser-use LLM provider using the Claude Code Python SDK.
 
-	Uses your subscription — no API key needed.
+	Uses ClaudeSDKClient for persistent session reuse — the CLI subprocess
+	stays alive between calls, cutting per-call overhead from ~23s to ~3-5s
+	after the initial connection.
 	"""
 
 	model: str = 'sonnet'
@@ -54,6 +60,12 @@ class ChatClaudeCode(BaseChatModel):
 	system_prompt: str = 'You are a browser automation assistant. Follow instructions precisely. Be concise. When asked for structured output, return ONLY valid JSON.'
 	max_turns: int = 1
 	extra_flags: list[str] = field(default_factory=list)
+	_client: Any = field(default=None, init=False, repr=False)
+	_client_lock: Any = field(default=None, init=False, repr=False)
+	_call_count: int = field(default=0, init=False, repr=False)
+
+	def __post_init__(self) -> None:
+		self._client_lock = asyncio.Lock()
 
 	@property
 	def provider(self) -> str:
@@ -63,8 +75,81 @@ class ChatClaudeCode(BaseChatModel):
 	def name(self) -> str:
 		return f'claude-code:{self.model}'
 
+	async def _ensure_client(self) -> Any:
+		"""Get or create the persistent ClaudeSDKClient connection."""
+		from claude_code_sdk import ClaudeCodeOptions, ClaudeSDKClient
+
+		if self._client_lock is None:
+			self._client_lock = asyncio.Lock()
+
+		async with self._client_lock:
+			if self._client is not None:
+				return self._client
+
+			logger.info('ChatClaudeCode: establishing persistent SDK connection (first call pays cold-start cost)...')
+			start = time.monotonic()
+
+			opts = ClaudeCodeOptions(
+				model=self.model,
+				max_turns=self.max_turns,
+				system_prompt=self.system_prompt,
+			)
+			client = ClaudeSDKClient(options=opts)
+			await client.connect()
+			self._client = client
+
+			elapsed = time.monotonic() - start
+			logger.info(f'ChatClaudeCode: persistent connection established in {elapsed:.1f}s')
+			return self._client
+
 	async def _call_sdk(self, prompt: str) -> str:
-		"""Call Claude via the Python SDK, handling unknown message types gracefully."""
+		"""Call Claude via the persistent SDK client, falling back to query() on failure."""
+		self._call_count += 1
+		call_num = self._call_count
+		start = time.monotonic()
+
+		try:
+			return await self._call_sdk_persistent(prompt, call_num, start)
+		except Exception as e:
+			err_str = str(e)
+			logger.warning(f'ChatClaudeCode: persistent client failed (call #{call_num}): {err_str[:200]}')
+			# Reset client so next call reconnects
+			await self._disconnect_client()
+			# Fall back to one-shot query() for this call
+			return await self._call_sdk_oneshot(prompt, call_num, start)
+
+	async def _call_sdk_persistent(self, prompt: str, call_num: int, start: float) -> str:
+		"""Send a query through the persistent ClaudeSDKClient."""
+		from claude_code_sdk import ResultMessage as SdkResultMessage
+
+		client = await self._ensure_client()
+		await client.query(prompt)
+
+		texts: list[str] = []
+		async for msg in client.receive_response():
+			if hasattr(msg, 'content') and msg.content:
+				content = msg.content
+				if isinstance(content, str):
+					texts.append(content)
+				elif isinstance(content, list):
+					for block in content:
+						if hasattr(block, 'text'):
+							texts.append(block.text)
+						elif isinstance(block, dict) and 'text' in block:
+							texts.append(block['text'])
+			if isinstance(msg, SdkResultMessage):
+				break
+
+		elapsed = time.monotonic() - start
+		logger.info(f'ChatClaudeCode: call #{call_num} completed in {elapsed:.1f}s (persistent)')
+
+		if not texts:
+			raise ModelProviderError(message='Empty response from persistent SDK client', model=self.name)
+
+		return '\n'.join(texts)
+
+	async def _call_sdk_oneshot(self, prompt: str, call_num: int, start: float) -> str:
+		"""Fallback: use one-shot query() — spawns a new process (slower, but reliable)."""
 		from claude_code_sdk import ClaudeCodeOptions, query
 
 		texts: list[str] = []
@@ -78,7 +163,6 @@ class ChatClaudeCode(BaseChatModel):
 					system_prompt=self.system_prompt,
 				),
 			):
-				# Collect text content from assistant messages
 				if hasattr(msg, 'content') and msg.content:
 					content = msg.content
 					if isinstance(content, str):
@@ -93,16 +177,31 @@ class ChatClaudeCode(BaseChatModel):
 			err_str = str(e)
 			# Handle rate_limit_event parse errors from SDK
 			if 'Unknown message type' in err_str and texts:
-				# We already got content before the error, use it
 				logger.warning(f'SDK parse error after receiving content: {err_str[:100]}')
 			elif 'rate_limit' in err_str.lower():
 				logger.warning('Rate limited, retrying in 5s...')
 				await asyncio.sleep(5)
-				return await self._call_sdk(prompt)
+				return await self._call_sdk_oneshot(prompt, call_num, time.monotonic())
 			else:
 				raise ModelProviderError(message=f'Claude SDK error: {err_str[:300]}', model=self.name) from e
 
+		elapsed = time.monotonic() - start
+		logger.info(f'ChatClaudeCode: call #{call_num} completed in {elapsed:.1f}s (oneshot fallback)')
+
 		return '\n'.join(texts)
+
+	async def _disconnect_client(self) -> None:
+		"""Disconnect the persistent client if active."""
+		if self._client is not None:
+			try:
+				await self._client.disconnect()
+			except Exception:
+				pass
+			self._client = None
+
+	async def close(self) -> None:
+		"""Clean up the persistent SDK connection. Call when done with the provider."""
+		await self._disconnect_client()
 
 	@overload
 	async def ainvoke(
