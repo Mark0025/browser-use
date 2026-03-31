@@ -17,11 +17,13 @@ from browser_use import Agent
 
 # Configure loguru
 logger.remove()
-logger.add(sys.stderr, format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{message}</cyan>", level="INFO")
-logger.add("qa_reports/qa_full_{time:YYYY-MM-DD}.log", rotation="10 MB", level="DEBUG")
+logger.add(
+	sys.stderr, format='<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{message}</cyan>', level='INFO'
+)
+logger.add('qa_reports/qa_full_{time:YYYY-MM-DD}.log', rotation='10 MB', level='DEBUG')
 
 from shared import (
-	DEV_URL,
+	TestResultMemory,
 	cleanup_temp_profiles,
 	create_browser_session,
 	create_llm,
@@ -35,9 +37,9 @@ from shared import (
 async def fetch_sitemap_async() -> dict:
 	"""Fetch sitemap with fallback."""
 	from shared import fetch_sitemap
+
 	sitemap = await fetch_sitemap()
 	if not sitemap:
-		from shared import get_sitemap_or_fallback
 		logger.warning('Using hardcoded sitemap fallback')
 		return {
 			'public': [
@@ -52,9 +54,21 @@ async def fetch_sitemap_async() -> dict:
 			'admin': {
 				'path': '/admin',
 				'tabs': [
-					'Site Settings', 'Users', 'Leads', 'Blogs', 'Testimonials', 'Images',
-					'Find & Replace', 'Dev Manual', 'Webhook / CRM', 'AI Content',
-					'AI Settings', 'Business Info', 'Branding', 'Content', 'Email Settings',
+					'Site Settings',
+					'Users',
+					'Leads',
+					'Blogs',
+					'Testimonials',
+					'Images',
+					'Find & Replace',
+					'Dev Manual',
+					'Webhook / CRM',
+					'AI Content',
+					'AI Settings',
+					'Business Info',
+					'Branding',
+					'Content',
+					'Email Settings',
 				],
 			},
 			'restricted': ['/dev-admin'],
@@ -72,9 +86,31 @@ async def main():
 
 	# Build admin tabs list for targeted testing
 	admin_tabs = sitemap.get('admin', {}).get('tabs', [])
-	already_tested = ['Blogs', 'Site Settings', 'Business Info', 'Testimonials']
+	public_pages = [p['name'] for p in sitemap.get('public', [])]
 
-	untested_tabs = [t for t in admin_tabs if t not in already_tested]
+	# Load test result memory — tracks what's been tested across runs
+	memory = TestResultMemory()
+
+	# Ensure all known sections are tracked
+	all_sections = (
+		[t.lower().replace(' ', '_') for t in admin_tabs]
+		+ [p['name'].lower().replace(' ', '_') for p in sitemap.get('public', [])]
+		+ ['lead_form', 'preview_mode', 'image_upload']
+	)
+	memory.ensure_sections_tracked(all_sections)
+
+	# Determine what to test based on memory
+	untested = memory.untested_sections()
+	failed = memory.failed_sections()
+	passed = memory.passed_sections()
+
+	# Map section IDs back to admin tab names for untested tabs
+	admin_tab_ids = {t.lower().replace(' ', '_'): t for t in admin_tabs}
+	untested_tabs = [admin_tab_ids[sid] for sid in untested if sid in admin_tab_ids]
+	failed_tabs = [admin_tab_ids[sid] for sid in failed if sid in admin_tab_ids]
+
+	# Generate the memory-driven prompt section
+	memory_prompt = memory.prompt_section()
 
 	task = f"""You are an aggressive QA tester for Fair Deal House Buyer.
 Auth: mark@localhousebuyers.net (Google/Clerk — session already active).
@@ -90,54 +126,35 @@ Example: https://dev.fairdealhousebuyer.com/admin (NOT https://fairdealhousebuye
 ## Known Issues
 {issues}
 
-## ALREADY TESTED (DO NOT RE-TEST — skip these entirely):
-- ✅ Blog CRUD — full cycle works
-- ✅ Site Settings — toggles, data source, migrations work
-- ✅ Business Info — phone change/revert works, live site updates
-- ✅ Testimonials — create works, #84 confirmed, but DELETE not tested yet
-- ✅ Homepage — nav, hero, lead form submit works
-- ✅ /reviews — testimonials display, issues found
-- ✅ /about — FOUC found
-- ✅ /how-it-works — works
+{memory_prompt}
 
-## YOUR MISSION — Test ONLY what has NOT been tested:
+## YOUR MISSION — Focus on untested and failed sections:
 
 ### Priority 1: Untested Admin Tabs (click each one, interact with everything)
-{chr(10).join(f'- **{t}** — click it, report what loads, try every form/button' for t in untested_tabs)}
+{chr(10).join(f'- **{t}** — click it, report what loads, try every form/button' for t in untested_tabs) if untested_tabs else '- All admin tabs have been tested!'}
+
+{'### Priority 1b: Re-test Failed Admin Tabs' + chr(10) + chr(10).join(f'- **{t}** — previously failed, re-test now' for t in failed_tabs) if failed_tabs else ''}
 
 For EACH tab: click it, scroll through all content, try every button, fill every form, change a value, save, verify.
 
 ### Priority 2: Verify Lead in Admin
 - Go to admin Leads tab
-- Look for the E2E-TEST BrowserUse lead we submitted earlier
-- Can you see it? Delete it.
+- Look for any E2E-TEST BrowserUse leads
+- Can you see them? Delete them.
 
 ### Priority 3: Images — Upload + Edit Test
 - Go to Images tab
 - Try uploading a small test image
-- Try editing an existing image (Issue #85 — may throw server error)
+- Try editing an existing image
 - Report what happens
 
-### Priority 4: Testimonial Delete
-- Go to Testimonials tab
-- Find and DELETE the E2E-BROWSERUSE-TEST testimonial
-- Also delete any old E2E test testimonials
+### Priority 4: Public Pages Not Yet Tested
+- Test any public pages listed as NOT TESTED above
+- For each: does it load? What content appears?
 
-### Priority 5: Public Pages Not Yet Tested
-- /privacy — does it load? What content?
-- /terms — does it load? What content?
-- /help — does it load? What content?
-- /blogs — click into an individual blog post, does it render properly?
-
-### Priority 6: Preview Mode
+### Priority 5: Preview Mode
 - Go to /preview — does it load? What does it show?
-- Try clicking any pencil/edit icons (Issue #75, #83)
-
-### Priority 7: Branding
-- Go to admin Branding tab
-- What fields are there? (colors, logo, fonts?)
-- Change a color, save, check public site — did it update?
-- REVERT the color back
+- Try clicking any pencil/edit icons
 
 ## RULES
 - DO NOT visit /dev-admin
@@ -145,9 +162,16 @@ For EACH tab: click it, scroll through all content, try every button, fill every
 - Clean up test data (delete what you create)
 - Note any `data-source` attributes you see in the DOM
 - If you see [ACTION] logs in console, note them
+- SKIP sections marked as PASSED unless you have reason to believe they broke
 
 ## Report Format
-### ADMIN SECTIONS TESTED
+For EACH section you test, clearly state the section name and result:
+### SECTION: [section_name]
+**STATUS**: PASS / FAIL / PARTIAL
+**EVIDENCE**: [what you observed]
+**ISSUES**: [any issues found, or "none"]
+
+### SUMMARY
 ### WORKING
 ### BROKEN (with issue # if applicable)
 ### NEW ISSUES
@@ -188,6 +212,14 @@ For EACH tab: click it, scroll through all content, try every button, fill every
 	print('=' * 80)
 
 	save_report('qa_full', report)
+
+	# Update test result memory from the report
+	memory.update_from_report(report, all_sections)
+	memory.save()
+	logger.info(
+		f'Test memory updated: {len(memory.passed_sections())} passed, '
+		f'{len(memory.failed_sections())} failed, {len(memory.untested_sections())} untested'
+	)
 
 	# Cleanup
 	shutil.rmtree(tmp_dir, ignore_errors=True)

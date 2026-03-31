@@ -18,11 +18,13 @@ from loguru import logger
 from browser_use import Agent
 
 logger.remove()
-logger.add(sys.stderr, format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{message}</cyan>", level="INFO")
-logger.add("scripts/qa_reports/qa_verify_{time:YYYY-MM-DD}.log", rotation="10 MB", level="DEBUG")
+logger.add(
+	sys.stderr, format='<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{message}</cyan>', level='INFO'
+)
+logger.add('scripts/qa_reports/qa_verify_{time:YYYY-MM-DD}.log', rotation='10 MB', level='DEBUG')
 
 from shared import (
-	DEV_URL,
+	TestResultMemory,
 	cleanup_temp_profiles,
 	create_browser_session,
 	create_llm,
@@ -37,8 +39,28 @@ async def main():
 	llm = create_llm('sonnet')
 	session, tmp_dir = create_browser_session()
 
+	# Load test result memory to show the agent what's already been tested
+	memory = TestResultMemory()
+	memory_prompt = memory.prompt_section()
+
+	# Sections this script covers
+	verify_sections = [
+		'email_settings',
+		'branding',
+		'users',
+		'privacy',
+		'terms',
+		'blogs',
+		'preview_mode',
+		'lead_form',
+		'image_upload',
+	]
+	memory.ensure_sections_tracked(verify_sections)
+
 	task = f"""You are doing a FINAL VERIFICATION pass on dev.fairdealhousebuyer.com.
-Everything below has NEVER been tested. Test each item and report exactly what you see.
+Focus on items that have NOT been tested or previously FAILED.
+
+{memory_prompt}
 
 ## CRITICAL: ALL URLs use https://dev.fairdealhousebuyer.com
 
@@ -145,6 +167,15 @@ For each item, report:
 	print('=' * 80)
 
 	save_report('qa_verify', report)
+
+	# Update test result memory from the report
+	memory.update_from_report(report, verify_sections)
+	memory.save()
+	logger.info(
+		f'Test memory updated: {len(memory.passed_sections())} passed, '
+		f'{len(memory.failed_sections())} failed, {len(memory.untested_sections())} untested'
+	)
+
 	shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
