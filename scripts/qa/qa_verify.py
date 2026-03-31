@@ -9,6 +9,7 @@ Usage:
     uv run python scripts/qa/qa_verify.py
 """
 
+import argparse
 import asyncio
 import shutil
 import sys
@@ -22,7 +23,6 @@ logger.add(sys.stderr, format="<green>{time:HH:mm:ss}</green> | <level>{level: <
 logger.add("scripts/qa_reports/qa_verify_{time:YYYY-MM-DD}.log", rotation="10 MB", level="DEBUG")
 
 from shared import (
-	DEV_URL,
 	cleanup_temp_profiles,
 	create_browser_session,
 	create_llm,
@@ -32,7 +32,7 @@ from shared import (
 )
 
 
-async def main():
+async def main(auto_create_issues: bool = False, issues_repo: str = 'Mark0025/wes', dry_run_issues: bool = False):
 	test_image = create_test_image()
 	llm = create_llm('sonnet')
 	session, tmp_dir = create_browser_session()
@@ -145,12 +145,31 @@ For each item, report:
 	print('=' * 80)
 
 	save_report('qa_verify', report)
+
+	# Auto-create GitHub issues if flag is set
+	if auto_create_issues:
+		from github_issues import create_issues_from_report
+		logger.info('Auto-creating GitHub issues from findings...')
+		results = create_issues_from_report(report, repo=issues_repo, dry_run=dry_run_issues)
+		created = sum(1 for r in results if r['status'] == 'created')
+		logger.info(f'Issue creation done: {created} created out of {len(results)} findings.')
+
 	shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 if __name__ == '__main__':
+	parser = argparse.ArgumentParser(description='QA verification pass')
+	parser.add_argument('--auto-create-issues', action='store_true', help='Auto-create GitHub issues from QA findings')
+	parser.add_argument('--issues-repo', default='Mark0025/wes', help='Target repo for issue creation (default: Mark0025/wes)')
+	parser.add_argument('--dry-run-issues', action='store_true', help='Preview issues without creating them')
+	args = parser.parse_args()
+
 	try:
-		asyncio.run(main())
+		asyncio.run(main(
+			auto_create_issues=args.auto_create_issues,
+			issues_repo=args.issues_repo,
+			dry_run_issues=args.dry_run_issues,
+		))
 	except KeyboardInterrupt:
 		logger.warning('Interrupted')
 	except Exception as e:
