@@ -161,3 +161,100 @@ Do what has been asked; nothing more, nothing less.
 NEVER create files unless they're absolutely necessary for achieving your goal.
 ALWAYS prefer editing an existing file to creating a new one.
 NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested by the User.
+
+---
+
+## Mark0025 Fork — ChatClaudeCode Provider + QA System
+
+**This fork adds a custom LLM provider and QA testing system.**
+
+### ChatClaudeCode Provider (`browser_use/llm/claude_code/chat.py`)
+
+A browser-use LLM provider that uses the **Claude Code Python SDK** (`claude-code-sdk`) instead of the Anthropic API. This means browser-use runs on your Claude Code **subscription** — $0 API cost.
+
+**Architecture:**
+```
+browser-use Agent → ChatClaudeCode.ainvoke() → claude-code-sdk.query() → claude CLI (subscription auth) → response
+```
+
+**Key details:**
+- Uses `claude-code-sdk` Python package (not `--print` subprocess — that was too slow at 20s/call)
+- Handles `rate_limit_event` parse errors from SDK gracefully (SDK bug, not ours)
+- Supports plain text and structured output (Pydantic models via `--json-schema`)
+- ~23s per call (CLI cold start + OAuth + CLAUDE.md loading + API call)
+- Registered in `browser_use/llm/__init__.py` lazy imports as `ChatClaudeCode`
+
+**Usage:**
+```python
+from browser_use import Agent
+from browser_use.llm.claude_code.chat import ChatClaudeCode
+
+llm = ChatClaudeCode(model='sonnet')  # or 'opus', 'haiku'
+agent = Agent(task='...', llm=llm, use_vision=True)
+await agent.run(max_steps=30)
+```
+
+**Limitations:**
+- ~23s per LLM call (vs ~3s with Anthropic API key directly)
+- Each call spawns a new claude process (no session reuse in --print mode)
+- CLI loads CLAUDE.md context on every call (~45k tokens overhead)
+
+### QA Testing System (`scripts/qa/`)
+
+AI-powered QA testing for web applications. Uses browser-use + ChatClaudeCode + Chrome profile reuse to test sites without closing Chrome.
+
+**Files:**
+```
+scripts/qa/
+├── shared.py          # Sitemap fetcher, Chrome profile copier, loguru setup, test image creator
+├── qa_full.py         # Full QA with progressive testing (skips already-tested sections)
+├── qa_verify.py       # Focused verification of unverified items only
+└── __init__.py
+
+scripts/qa_reports/    # Generated QA reports (markdown)
+```
+
+**Key features:**
+- **Sitemap fetching**: Pulls route map from `/api/dev/sitemap` (with hardcoded fallback)
+- **Chrome profile copy**: Copies Chrome profile to temp dir — no need to close Chrome
+- **Progressive testing**: Tracks what's been tested, skips proven sections on re-runs
+- **Human takeover**: If the human interacts with the browser, the AI logs it and continues
+- **Loguru logging**: Real-time logs to stderr + rotating log files
+- **Test image creation**: Generates PNG programmatically for upload testing
+- **Report saving**: Markdown reports with evidence trails
+
+**How to run:**
+```bash
+cd ~/browser-use
+uv run python scripts/qa/qa_full.py      # Full QA pass
+uv run python scripts/qa/qa_verify.py    # Verification of gaps only
+```
+
+**Results from 6 runs against dev.fairdealhousebuyer.com:**
+- 88.5% coverage (23/26 test areas)
+- 13/15 admin tabs proven working
+- All 8 public pages proven working
+- Blog CRUD full cycle proven
+- Business Info change/revert proven (live site updates instantly)
+- Testimonial CRUD proven
+- Lead form submit proven
+- Email Reply-To typo found and fixed
+- Issue #84 (testimonials missing preview button) confirmed
+- Evidence report: Mark0025/wes#205
+
+### Dependencies Added (fork-specific)
+- `claude-code-sdk` — Python SDK for Claude Code CLI
+- `loguru` — structured logging
+- `httpx` — async HTTP for sitemap fetching
+
+### Open Issues on This Fork
+See https://github.com/Mark0025/browser-use/issues for the roadmap:
+- #1: Pre-loaded sitemap (DONE)
+- #2: Focused test scripts per section
+- #3: Network interception (see API calls)
+- #4: Test result memory (don't re-test passing features)
+- #5: Auto-create GitHub issues from findings
+- #6: Speed optimization (reduce 23s/call)
+- #7: Final verification pass (DONE)
+- #8: Consolidated evidence report
+- #9: Test image for upload testing (DONE)
