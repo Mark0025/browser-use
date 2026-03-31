@@ -72,12 +72,16 @@ async def main():
 
 	# Build admin tabs list for targeted testing
 	admin_tabs = sitemap.get('admin', {}).get('tabs', [])
-	already_tested = ['Blogs']  # From previous run — skip these
+	already_tested = ['Blogs', 'Site Settings', 'Business Info', 'Testimonials']
 
 	untested_tabs = [t for t in admin_tabs if t not in already_tested]
 
 	task = f"""You are an aggressive QA tester for Fair Deal House Buyer.
 Auth: mark@localhousebuyers.net (Google/Clerk — session already active).
+
+## CRITICAL: ALL URLs must use https://dev.fairdealhousebuyer.com (the DEV site)
+NEVER navigate to fairdealhousebuyer.com (production). ALWAYS use dev.fairdealhousebuyer.com.
+Example: https://dev.fairdealhousebuyer.com/admin (NOT https://fairdealhousebuyer.com/admin)
 
 {sitemap_section}
 
@@ -86,49 +90,54 @@ Auth: mark@localhousebuyers.net (Google/Clerk — session already active).
 ## Known Issues
 {issues}
 
-## PREVIOUSLY TESTED (skip unless you see something broken):
-- Blog CRUD: ✅ PASSED (create, edit, publish, verify public, delete — all work)
-- Public /reviews: Found issues (E2E test data, missing stats, dual copyright)
-- Public homepage: ✅ Navigation, hero, lead forms work
-- Public /about: ⚠️ Loading flash (FOUC)
-- Public /how-it-works: ✅ Works
+## ALREADY TESTED (DO NOT RE-TEST — skip these entirely):
+- ✅ Blog CRUD — full cycle works
+- ✅ Site Settings — toggles, data source, migrations work
+- ✅ Business Info — phone change/revert works, live site updates
+- ✅ Testimonials — create works, #84 confirmed, but DELETE not tested yet
+- ✅ Homepage — nav, hero, lead form submit works
+- ✅ /reviews — testimonials display, issues found
+- ✅ /about — FOUC found
+- ✅ /how-it-works — works
 
-## YOUR MISSION — Test what was NOT tested last time:
+## YOUR MISSION — Test ONLY what has NOT been tested:
 
-### Priority 1: Admin Sections (UNTESTED)
-Click each of these admin tabs and test thoroughly:
-{chr(10).join(f'- {t}' for t in untested_tabs)}
+### Priority 1: Untested Admin Tabs (click each one, interact with everything)
+{chr(10).join(f'- **{t}** — click it, report what loads, try every form/button' for t in untested_tabs)}
 
-For each tab:
-1. Click it — does it load?
-2. What data/forms/buttons are visible?
-3. Try interacting with forms — change a value, save, verify
-4. Look for `data-source` attributes in the DOM (tells you what server action feeds this component)
+For EACH tab: click it, scroll through all content, try every button, fill every form, change a value, save, verify.
 
-### Priority 2: Testimonial CRUD
-- Create testimonial: name="E2E-BROWSERUSE-TEST", rating=5, text="Test from browser-use"
-- Check if preview button exists (Issue #84)
-- Go to public /reviews — does it show?
-- Delete it from admin
+### Priority 2: Verify Lead in Admin
+- Go to admin Leads tab
+- Look for the E2E-TEST BrowserUse lead we submitted earlier
+- Can you see it? Delete it.
 
-### Priority 3: Settings Change + Revert
-- Go to Business Info or Branding
-- Note current phone number
-- Change it to "555-BROWSER-USE-TEST"
-- Save, check public site footer — did it update?
-- REVERT to original, save again
+### Priority 3: Images — Upload + Edit Test
+- Go to Images tab
+- Try uploading a small test image
+- Try editing an existing image (Issue #85 — may throw server error)
+- Report what happens
 
-### Priority 4: Lead Form Submission
-- Go to public homepage
-- Fill lead form: First=E2E-TEST, Last=BrowserUse, Address=123 Test St, City=Oklahoma City, State=Oklahoma, ZIP=73101, Phone=555-000-1234, Email=e2e@test.com
-- Submit — what happens?
-- Go to admin Leads tab — is it there?
+### Priority 4: Testimonial Delete
+- Go to Testimonials tab
+- Find and DELETE the E2E-BROWSERUSE-TEST testimonial
+- Also delete any old E2E test testimonials
 
-### Priority 5: Remaining Public Pages
-- /privacy — does it load?
-- /terms — does it load?
-- /help — does it load?
-- /blogs — click into a blog post, does it render?
+### Priority 5: Public Pages Not Yet Tested
+- /privacy — does it load? What content?
+- /terms — does it load? What content?
+- /help — does it load? What content?
+- /blogs — click into an individual blog post, does it render properly?
+
+### Priority 6: Preview Mode
+- Go to /preview — does it load? What does it show?
+- Try clicking any pencil/edit icons (Issue #75, #83)
+
+### Priority 7: Branding
+- Go to admin Branding tab
+- What fields are there? (colors, logo, fonts?)
+- Change a color, save, check public site — did it update?
+- REVERT the color back
 
 ## RULES
 - DO NOT visit /dev-admin
@@ -159,7 +168,7 @@ For each tab:
 		step_timeout=240,
 	)
 
-	result = await agent.run(max_steps=30)
+	result = await agent.run(max_steps=40)
 
 	# Extract report
 	report_lines = []

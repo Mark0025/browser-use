@@ -137,17 +137,18 @@ def create_llm(model: str = 'sonnet') -> ChatClaudeCode:
 def sitemap_prompt_section(sitemap: dict) -> str:
 	"""Convert sitemap dict into a prompt section for the agent."""
 	lines = ['## Site Map (pre-loaded — skip discovery, go straight to testing)']
+	lines.append(f'**BASE URL: {DEV_URL}** — ALL navigation must use this domain.')
 	lines.append('')
 	lines.append('### Public Pages')
 	for page in sitemap.get('public', []):
-		lines.append(f"- `{page['path']}` — {page['name']}")
+		lines.append(f"- `{DEV_URL}{page['path']}` — {page['name']}")
 	lines.append('')
-	lines.append('### Admin Dashboard (/admin)')
+	lines.append(f'### Admin Dashboard ({DEV_URL}/admin)')
 	lines.append('Tabs in sidebar: ' + ', '.join(sitemap.get('admin', {}).get('tabs', [])))
 	lines.append('')
 	lines.append('### RESTRICTED — DO NOT VISIT')
 	for r in sitemap.get('restricted', []):
-		lines.append(f'- `{r}`')
+		lines.append(f'- `{DEV_URL}{r}`')
 	return '\n'.join(lines)
 
 
