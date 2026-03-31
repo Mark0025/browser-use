@@ -17,16 +17,19 @@ from browser_use import Agent
 
 # Configure loguru
 logger.remove()
-logger.add(sys.stderr, format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{message}</cyan>", level="INFO")
-logger.add("qa_reports/qa_full_{time:YYYY-MM-DD}.log", rotation="10 MB", level="DEBUG")
+logger.add(
+	sys.stderr, format='<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{message}</cyan>', level='INFO'
+)
+logger.add('qa_reports/qa_full_{time:YYYY-MM-DD}.log', rotation='10 MB', level='DEBUG')
 
 from shared import (
-	DEV_URL,
+	attach_network_watchdog,
 	cleanup_temp_profiles,
 	create_browser_session,
 	create_llm,
 	get_github_issues,
 	human_takeover_prompt,
+	network_prompt_section,
 	save_report,
 	sitemap_prompt_section,
 )
@@ -35,9 +38,9 @@ from shared import (
 async def fetch_sitemap_async() -> dict:
 	"""Fetch sitemap with fallback."""
 	from shared import fetch_sitemap
+
 	sitemap = await fetch_sitemap()
 	if not sitemap:
-		from shared import get_sitemap_or_fallback
 		logger.warning('Using hardcoded sitemap fallback')
 		return {
 			'public': [
@@ -52,9 +55,21 @@ async def fetch_sitemap_async() -> dict:
 			'admin': {
 				'path': '/admin',
 				'tabs': [
-					'Site Settings', 'Users', 'Leads', 'Blogs', 'Testimonials', 'Images',
-					'Find & Replace', 'Dev Manual', 'Webhook / CRM', 'AI Content',
-					'AI Settings', 'Business Info', 'Branding', 'Content', 'Email Settings',
+					'Site Settings',
+					'Users',
+					'Leads',
+					'Blogs',
+					'Testimonials',
+					'Images',
+					'Find & Replace',
+					'Dev Manual',
+					'Webhook / CRM',
+					'AI Content',
+					'AI Settings',
+					'Business Info',
+					'Branding',
+					'Content',
+					'Email Settings',
 				],
 			},
 			'restricted': ['/dev-admin'],
@@ -69,6 +84,9 @@ async def main():
 
 	llm = create_llm('sonnet')
 	session, tmp_dir = create_browser_session()
+
+	# Attach network interception — captures API calls for agent visibility
+	network_watchdog = attach_network_watchdog(session)
 
 	# Build admin tabs list for targeted testing
 	admin_tabs = sitemap.get('admin', {}).get('tabs', [])
@@ -139,6 +157,15 @@ For EACH tab: click it, scroll through all content, try every button, fill every
 - Change a color, save, check public site — did it update?
 - REVERT the color back
 
+## NETWORK MONITORING (ACTIVE)
+Network interception is enabled. You can see API calls, status codes, and response headers
+in the system context. Pay attention to:
+- 4xx/5xx errors on API calls — these indicate server-side problems
+- `x-data-source` headers — shows if data comes from DB, cache, or JSON
+- `x-cache` headers — shows if responses are cached
+- Failed requests — network errors that don't surface in the UI
+Report any API errors you observe in the "NETWORK ISSUES" section of your report.
+
 ## RULES
 - DO NOT visit /dev-admin
 - Prefix test data with "E2E-BROWSERUSE-TEST"
@@ -153,10 +180,14 @@ For EACH tab: click it, scroll through all content, try every button, fill every
 ### NEW ISSUES
 ### DATA SOURCES OBSERVED (data-source attributes found)
 ### HUMAN INTERACTIONS OBSERVED (if any)
+### NETWORK ISSUES (API errors, failed requests, unexpected status codes)
 ### OVERALL SCORE (/10)
 """
 
 	logger.info(f'Starting QA with {len(untested_tabs)} untested admin tabs...')
+
+	# Build network context that will be appended to the system message
+	network_context = network_prompt_section(network_watchdog, last_n=15)
 
 	agent = Agent(
 		task=task,
@@ -166,6 +197,7 @@ For EACH tab: click it, scroll through all content, try every button, fill every
 		max_actions_per_step=3,
 		llm_timeout=180,
 		step_timeout=240,
+		extend_system_message=network_context if network_context else None,
 	)
 
 	result = await agent.run(max_steps=40)
