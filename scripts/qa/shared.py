@@ -19,6 +19,7 @@ import httpx
 from loguru import logger
 
 from browser_use import BrowserProfile, BrowserSession
+from browser_use.browser.watchdogs.network_watchdog import NetworkWatchdog
 from browser_use.llm.claude_code.chat import ChatClaudeCode
 
 # Base URL for the dev site
@@ -36,7 +37,9 @@ async def fetch_sitemap() -> dict | None:
 			resp = await client.get(f'{DEV_URL}/api/dev/sitemap')
 			if resp.status_code == 200:
 				data = resp.json()
-				logger.success(f"Fetched sitemap: {len(data.get('public', []))} public, {len(data.get('admin', {}).get('tabs', []))} admin tabs")
+				logger.success(
+					f'Fetched sitemap: {len(data.get("public", []))} public, {len(data.get("admin", {}).get("tabs", []))} admin tabs'
+				)
 				return data
 			else:
 				logger.warning(f'Sitemap returned {resp.status_code} — using hardcoded fallback')
@@ -67,9 +70,21 @@ def get_sitemap_or_fallback() -> dict:
 		'admin': {
 			'path': '/admin',
 			'tabs': [
-				'Site Settings', 'Users', 'Leads', 'Blogs', 'Testimonials', 'Images',
-				'Find & Replace', 'Dev Manual', 'Webhook / CRM', 'AI Content',
-				'AI Settings', 'Business Info', 'Branding', 'Content', 'Email Settings',
+				'Site Settings',
+				'Users',
+				'Leads',
+				'Blogs',
+				'Testimonials',
+				'Images',
+				'Find & Replace',
+				'Dev Manual',
+				'Webhook / CRM',
+				'AI Content',
+				'AI Settings',
+				'Business Info',
+				'Branding',
+				'Content',
+				'Email Settings',
 			],
 		},
 		'restricted': ['/dev-admin'],
@@ -94,8 +109,8 @@ def get_github_issues(repo: str = 'Mark0025/wes') -> str:
 	issues = json.loads(result.stdout)
 	lines = []
 	for issue in issues:
-		labels = ', '.join(l['name'] for l in issue.get('labels', []))
-		lines.append(f"- #{issue['number']}: {issue['title']} [{labels}]")
+		labels = ', '.join(label['name'] for label in issue.get('labels', []))
+		lines.append(f'- #{issue["number"]}: {issue["title"]} [{labels}]')
 	logger.success(f'Fetched {len(lines)} open issues')
 	return '\n'.join(lines)
 
@@ -141,7 +156,7 @@ def sitemap_prompt_section(sitemap: dict) -> str:
 	lines.append('')
 	lines.append('### Public Pages')
 	for page in sitemap.get('public', []):
-		lines.append(f"- `{DEV_URL}{page['path']}` — {page['name']}")
+		lines.append(f'- `{DEV_URL}{page["path"]}` — {page["name"]}')
 	lines.append('')
 	lines.append(f'### Admin Dashboard ({DEV_URL}/admin)')
 	lines.append('Tabs in sidebar: ' + ', '.join(sitemap.get('admin', {}).get('tabs', [])))
@@ -198,7 +213,7 @@ def create_test_image(path: str = '/tmp/browser-use-test-image.png') -> str:
 
 	def chunk(chunk_type: bytes, data: bytes) -> bytes:
 		c = chunk_type + data
-		crc = struct.pack('>I', _zlib.crc32(c) & 0xffffffff)
+		crc = struct.pack('>I', _zlib.crc32(c) & 0xFFFFFFFF)
 		return struct.pack('>I', len(data)) + c + crc
 
 	png = b'\x89PNG\r\n\x1a\n'
@@ -211,9 +226,44 @@ def create_test_image(path: str = '/tmp/browser-use-test-image.png') -> str:
 	return path
 
 
+def attach_network_watchdog(
+	session: BrowserSession,
+	max_entries: int = 100,
+	api_patterns: list[str] | None = None,
+) -> NetworkWatchdog:
+	"""Attach a NetworkWatchdog to a BrowserSession.
+
+	Call this BEFORE the session connects to the browser. The watchdog
+	will automatically start capturing API calls once the browser connects.
+
+	Returns the watchdog instance — use ``watchdog.format_for_prompt()``
+	to get a formatted string for agent context injection.
+	"""
+	NetworkWatchdog.model_rebuild()
+
+	kwargs: dict = {
+		'event_bus': session.event_bus,
+		'browser_session': session,
+		'max_entries': max_entries,
+	}
+	if api_patterns is not None:
+		kwargs['api_patterns'] = api_patterns
+
+	watchdog = NetworkWatchdog(**kwargs)
+	watchdog.attach_to_session()
+	logger.info('🌐 Network watchdog attached — will capture API calls')
+	return watchdog
+
+
+def network_prompt_section(watchdog: NetworkWatchdog, last_n: int = 15) -> str:
+	"""Format captured network activity as a prompt section for the agent."""
+	return watchdog.format_for_prompt(last_n=last_n)
+
+
 def cleanup_temp_profiles():
 	"""Remove all temporary Chrome profiles."""
 	import glob
+
 	for d in glob.glob('/tmp/browser-use-chrome-*'):
 		shutil.rmtree(d, ignore_errors=True)
 	logger.info('Cleaned up temp Chrome profiles')
